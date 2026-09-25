@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 """
-sampex_visualizer.py
+Visualizer.py
 
-Debug visualizer for .sampex files produced by PexTest.cpp.
+Debug visualizer for .sampex files produced by Pex_Test.cpp.
 
-Two views:
-  1. Static layout  -- all segments drawn as rectangles, colored by layer,
-                        labeled with net id. Good for sanity-checking parsing.
+Three views:
+  1. Static layout  -- all segments drawn as rectangles, colored by layer.
+                        Good for sanity-checking parsing.
   2. Sweep animation -- steps through the sweep log, drawing a vertical
                         sweep-line at the event's x, and highlighting the
                         currently-active segment set. Good for debugging
                         the IntervalTree insert/erase sequence itself.
+  3. Net view        -- given a net name, shows only that net's segments
+                        (across all layers -- net_id is shared across layers
+                        by vias/contacts, so this doesn't need separate via
+                        data, it just filters by net_id). Each segment is
+                        labeled with its area, so R/C values in the .sampex
+                        can be sanity-checked at a glance against geometry.
 
 Usage:
-    python3 sampex_visualizer.py <file.sampex>                 # static layout only
-    python3 sampex_visualizer.py <file.sampex> --animate        # sweep animation
-    python3 sampex_visualizer.py <file.sampex> --animate --save out.gif
+    python3 Visualizer.py <file.sampex>                 # static layout
+    python3 Visualizer.py <file.sampex> --animate        # sweep animation
+    python3 Visualizer.py <file.sampex> --net Y          # net view for net "Y"
 """
 
 import argparse
@@ -26,6 +32,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import matplotlib.animation as animation
 
+Use_Gray_Nets = False
 
 # Fixed layer -> color mapping so colors stay consistent across runs/files.
 LAYER_COLORS = {
@@ -51,7 +58,8 @@ def load_sampex(path):
         data = json.load(f)
     segments = data.get("segments", [])
     sweep = data.get("sweep", [])
-    return segments, sweep
+    nets = data.get("nets", [])
+    return segments, sweep, nets
 
 
 def layer_color(layer):
@@ -68,6 +76,10 @@ def compute_bounds(segments):
     pad_x = max(1, (x_hi - x_lo) * 0.05)
     pad_y = max(1, (y_hi - y_lo) * 0.05)
     return (x_lo - pad_x, x_hi + pad_x, y_lo - pad_y, y_hi + pad_y)
+
+
+def segment_area(seg):
+    return (seg["x_hi"] - seg["x_lo"]) * (seg["y_hi"] - seg["y_lo"])
 
 
 def draw_segment(ax, seg, facecolor, edgecolor="black", alpha=0.7, linewidth=0.8):
@@ -106,7 +118,7 @@ def plot_static(segments, title="PEX Layout"):
     return fig, ax
 
 
-def plot_sweep_animation(segments, sweep, save_path=None, interval_ms=300):
+def plot_sweep_animation(segments, sweep, interval_ms=300):
     if not sweep:
         print("No sweep events found in this .sampex file -- nothing to animate.")
         return
@@ -120,11 +132,13 @@ def plot_sweep_animation(segments, sweep, save_path=None, interval_ms=300):
         ax.clear()
         step = sweep[step_idx]
 
-        # Draw all segments faded out as context
         for seg in segments:
-            draw_segment(ax, seg, layer_color(seg["layer"]), alpha=0.15, edgecolor="none")
+            if Use_Gray_Nets:
+                draw_segment(ax, seg, "#dddddd", alpha=1.0, edgecolor="#bbbbbb", linewidth=0.5)
+            else:
+                draw_segment(ax, seg, layer_color(seg["layer"]), alpha=0.15, edgecolor="none")
 
-        # Highlight the currently active set
+        # Highlight the currently active set in full, correct layer color
         for seg_id in step["active"]:
             seg = seg_by_id.get(seg_id)
             if seg is None:
@@ -147,30 +161,91 @@ def plot_sweep_animation(segments, sweep, save_path=None, interval_ms=300):
     anim = animation.FuncAnimation(
         fig, draw_frame, frames=len(sweep), interval=interval_ms, repeat=True
     )
+    plt.tight_layout()
+    plt.show()
 
-    if save_path:
-        print(f"Saving animation to {save_path} ...")
-        anim.save(save_path, writer="pillow")
-        print("Done.")
-    else:
-        plt.tight_layout()
-        plt.show()
+
+def plot_net(segments, net_name, nets_summary=None):
+    net_segments = [s for s in segments if str(s["net"]) == net_name]
+
+    if not net_segments:
+        # net_name might be a name string but "net" field in segments is a
+        # numeric id -- try resolving via the nets summary if present.
+        if nets_summary:
+            match = next((n for n in nets_summary if n["net_name"] == net_name), None)
+            if match:
+                net_segments = [s for s in segments if s["net"] == match["net_id"]]
+
+    if not net_segments:
+        print(f"No segments found for net '{net_name}'.", file=sys.stderr)
+        print("Available nets:", sorted({s["net"] for s in segments}), file=sys.stderr)
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+
+    for seg in segments:
+        if Use_Gray_Nets:
+            draw_segment(ax, seg, "#dddddd", alpha=1.0, edgecolor="#bbbbbb", linewidth=0.5)
+        else:
+            draw_segment(ax, seg, layer_color(seg["layer"]), alpha=0.15, edgecolor="none")
+
+    total_area = 0
+    for seg in net_segments:
+        area = segment_area(seg)
+        total_area += area
+        draw_segment(ax, seg, layer_color(seg["layer"]), alpha=0.85, edgecolor="black", linewidth=1.2)
+
+        cx = (seg["x_lo"] + seg["x_hi"]) / 2
+        cy = (seg["y_lo"] + seg["y_hi"]) / 2
+        label = f"A={area}"
+        if "resistance" in seg:
+            label += f"\nR={seg['resistance']:.3g}"
+        if "cap_ground" in seg:
+            label += f"\nC={seg['cap_ground']:.3g}"
+        ax.text(cx, cy, label, ha="center", va="center", fontsize=6.5,
+                 bbox=dict(boxstyle="round,pad=0.15", facecolor="white", alpha=0.75, edgecolor="none"))
+
+    x_lo, x_hi, y_lo, y_hi = compute_bounds(segments)
+    ax.set_xlim(x_lo, x_hi)
+    ax.set_ylim(y_lo, y_hi)
+    ax.set_aspect("equal")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+
+    present_layers = sorted({seg["layer"] for seg in net_segments})
+    handles = [
+        patches.Patch(facecolor=layer_color(l), edgecolor="black", label=l)
+        for l in present_layers
+    ]
+    ax.legend(handles=handles, loc="upper right", fontsize=8, framealpha=0.9)
+
+    title = f"Net '{net_name}'  |  {len(net_segments)} segments  |  total area={total_area}"
+    if nets_summary:
+        match = next((n for n in nets_summary if str(n["net_id"]) == net_name or n["net_name"] == net_name), None)
+        if match:
+            title += f"\nR_total={match['resistance_total']:.4g}  C_ground_total={match['cap_ground_total']:.4g}"
+    ax.set_title(title, fontsize=10)
+
+    plt.tight_layout()
+    plt.show()
 
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize a .sampex PEX debug file.")
     parser.add_argument("sampex_file", help="Path to the .sampex file")
-    parser.add_argument("--animate", action="store_true", help="Show the sweep-line animation instead of/after the static layout")
-    parser.add_argument("--save", metavar="OUT.gif", help="Save the animation to a file instead of showing it interactively")
+    parser.add_argument("--animate", action="store_true", help="Show the sweep-line animation")
     parser.add_argument("--interval", type=int, default=300, help="Animation frame interval in ms (default: 300)")
+    parser.add_argument("--net", metavar="NET_NAME_OR_ID", help="Show only the segments belonging to this net (across all layers), with per-segment area/R/C labels")
     args = parser.parse_args()
 
-    segments, sweep = load_sampex(args.sampex_file)
+    segments, sweep, nets = load_sampex(args.sampex_file)
     if not segments:
         print(f"Warning: no segments found in {args.sampex_file}", file=sys.stderr)
 
-    if args.animate:
-        plot_sweep_animation(segments, sweep, save_path=args.save, interval_ms=args.interval)
+    if args.net is not None:
+        plot_net(segments, args.net, nets_summary=nets)
+    elif args.animate:
+        plot_sweep_animation(segments, sweep, interval_ms=args.interval)
     else:
         plot_static(segments, title=args.sampex_file)
         plt.show()

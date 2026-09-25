@@ -13,6 +13,7 @@
 //      for stage 1 -- ground is a uniform plane, so this is just per-segment geometry math).
 //   6. Export everything to a .sampex file for the Python visualizer.
 //
+// This file is standalone: it does not #include any of the router's files.
 
 #include <bits/stdc++.h>
 #include "Interval_Tree.cpp"
@@ -153,6 +154,24 @@ struct SegmentResult {
     double cap_ground;
 };
 
+// Per-net aggregated results, computed from all segments sharing a net_id.
+//
+// cap_ground_total is exact for stage 1: ground capacitors from independent
+// segments simply add in parallel, regardless of how the segments connect.
+//
+// resistance_total is NOT a true net resistance -- it is the flat sum of every
+// segment's resistance on this net, as if they were all in series. We have no
+// connectivity/adjacency information in this file (no corner-stitch, no via
+// graph), so a topologically-correct series/parallel reduction isn't possible
+// here. Treat resistance_total as a rough upper-bound/sanity number only.
+struct NetResult {
+    unsigned int net_id;
+    string net_name;
+    int segment_count;
+    double resistance_total;   // naive sum -- see note above, NOT series-correct
+    double cap_ground_total;   // exact -- ground caps add in parallel regardless of topology
+};
+
 // One recorded step of the sweep, for the visualizer
 struct SweepStep {
     Coord x;
@@ -181,12 +200,61 @@ double computeGroundCap(const SegmentInterval& seg) {
 }
 
 // ---------------------------------------------------------------------------
+// Per-net aggregation (see NetResult comment above for the resistance caveat)
+// ---------------------------------------------------------------------------
+vector<NetResult> aggregateByNet(const vector<SegmentResult>& results, const vector<string>& netList) {
+    map<unsigned int, NetResult> byNet; // map (not unordered_map) so output is net_id-sorted
+
+    for (const auto& r : results) {
+        auto it = byNet.find(r.net_id);
+        if (it == byNet.end()) {
+            NetResult n;
+            n.net_id = r.net_id;
+            n.net_name = (r.net_id < netList.size()) ? netList[r.net_id] : "?";
+            n.segment_count = 0;
+            n.resistance_total = 0.0;
+            n.cap_ground_total = 0.0;
+            it = byNet.emplace(r.net_id, n).first;
+        }
+        it->second.segment_count += 1;
+        it->second.resistance_total += r.resistance;
+        it->second.cap_ground_total += r.cap_ground;
+    }
+
+    vector<NetResult> out;
+    out.reserve(byNet.size());
+    for (auto& [id, n] : byNet) out.push_back(n);
+    return out;
+}
+
+void printNetSummary(const vector<NetResult>& nets) {
+    cout << "\n--- Per-net PEX summary (stage 1: ground cap only, no coupling) ---\n";
+    cout << "NOTE: resistance_total is a naive sum of all segments on the net,\n";
+    cout << "      not a topologically-correct series/parallel value (no\n";
+    cout << "      connectivity info available at this stage).\n\n";
+    cout << left << setw(10) << "net"
+         << right << setw(8) << "segs"
+         << setw(16) << "R_total (ohm)"
+         << setw(18) << "C_ground_total"
+         << "\n";
+    for (const auto& n : nets) {
+        cout << left << setw(10) << n.net_name
+             << right << setw(8) << n.segment_count
+             << setw(16) << n.resistance_total
+             << setw(18) << n.cap_ground_total
+             << "\n";
+    }
+    cout << "\n";
+}
+
+// ---------------------------------------------------------------------------
 // .sampex export
 // ---------------------------------------------------------------------------
 void exportSampex(
     const string& filename,
     const vector<SegmentResult>& results,
-    const vector<SweepStep>& sweep
+    const vector<SweepStep>& sweep,
+    const vector<NetResult>& nets
 ) {
     ofstream fout(filename);
     if (!fout) {
@@ -212,6 +280,22 @@ void exportSampex(
              << "\"cap_ground\":" << r.cap_ground
              << "}";
         if (i + 1 < results.size()) fout << ",";
+        fout << "\n";
+    }
+    fout << "  ],\n";
+
+    // ---- nets ----
+    fout << "  \"nets\": [\n";
+    for (size_t i = 0; i < nets.size(); i++) {
+        const auto& n = nets[i];
+        fout << "    {"
+             << "\"net_id\":" << n.net_id << ","
+             << "\"net_name\":\"" << n.net_name << "\","
+             << "\"segment_count\":" << n.segment_count << ","
+             << "\"resistance_total\":" << n.resistance_total << ","
+             << "\"cap_ground_total\":" << n.cap_ground_total
+             << "}";
+        if (i + 1 < nets.size()) fout << ",";
         fout << "\n";
     }
     fout << "  ],\n";
@@ -243,7 +327,7 @@ void exportSampex(
 // ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
     if (argc < 2) {
-        cerr << "Usage: ./Pex_Test <file.rect> [output.sampex]\n";
+        cerr << "Usage: ./PexTest <file.rect> [output.sampex]\n";
         return 1;
     }
 
@@ -332,11 +416,18 @@ int main(int argc, char** argv) {
         results.push_back(r);
     }
 
-    exportSampex(outputFile, results, sweepLog);
+    // Aggregate per-net R/C (see NetResult comment for the resistance caveat)
+    vector<NetResult> netResults = aggregateByNet(results, netList);
+
+    exportSampex(outputFile, results, sweepLog, netResults);
 
     cout << "Parsed " << segments.size() << " segments from " << inputFile << "\n";
     cout << "Ran " << events.size() << " sweep events\n";
     cout << "Wrote " << outputFile << "\n";
 
+    printNetSummary(netResults);
+
     return 0;
 }
+
+// ToDo: Add VIA Resistance cost as well

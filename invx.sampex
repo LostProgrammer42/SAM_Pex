@@ -67,6 +67,13 @@
     {"id":64,"net":1,"layer":"m1","x_lo":15,"x_hi":20,"y_lo":45,"y_hi":50,"resistance":0.05,"cap_ground":0.0025},
     {"id":65,"net":4,"layer":"m1","x_lo":23,"x_hi":28,"y_lo":45,"y_hi":50,"resistance":0.05,"cap_ground":0.0025}
   ],
+  "nets": [
+    {"net_id":0,"net_name":"#","segment_count":16,"resistance_total":0.7,"cap_ground_total":0.0272},
+    {"net_id":1,"net_name":"Y","segment_count":23,"resistance_total":3.34988,"cap_ground_total":0.0785},
+    {"net_id":2,"net_name":"GND","segment_count":7,"resistance_total":0.71,"cap_ground_total":0.0214},
+    {"net_id":3,"net_name":"A","segment_count":9,"resistance_total":1.296,"cap_ground_total":0.0132},
+    {"net_id":4,"net_name":"Vdd","segment_count":11,"resistance_total":1.365,"cap_ground_total":0.0474}
+  ],
   "sweep": [
     {"x":4,"event":"insert","seg_id":42,"active":[42]},
     {"x":4,"event":"insert","seg_id":46,"active":[42,46]},
