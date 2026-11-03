@@ -1,433 +1,401 @@
-// Author: Stavan Mehta, Affaan Fakih
-// Version: Pilot Initial (V0)
-//
-// PexTest: standalone driver for stage-1 PEX (ground-only capacitance, no coupling).
-//
-// Pipeline:
-//   1. Parse a routed .rect file into rectangles (same grammar as the router's .rect,
-//      but parsed independently here -- no dependency on Corner_Stitch.cpp / Modular_Route.cpp).
-//   2. Build one SegmentInterval per rectangle.
-//   3. Run an x-sweep: INSERT at x_lo, DELETE at x_hi, using IntervalTree as the active set.
-//   4. At each event, snapshot the active set (for the visualizer).
-//   5. Compute flat per-segment resistance and ground capacitance (no tree query needed
-//      for stage 1 -- ground is a uniform plane, so this is just per-segment geometry math).
-//   6. Export everything to a .sampex file for the Python visualizer.
-//
-// This file is standalone: it does not #include any of the router's files.
+// Pex_Test.cpp -- parasitic extraction driver (coupling capacitance, analytic model).
+// Unity build: compile ONLY this file.
+//   g++ -O2 -std=c++17 Pex_Test.cpp -o pex
+//   ./pex [design.def] [tech.cfg] [out.sampex]
+#include "Helpers.cpp"
+#include "Quad_Trees.cpp"
 
-#include <bits/stdc++.h>
-#include "Interval_Tree.cpp"
-using namespace std;
+#include <chrono>
+#include <functional>
 
-// ---------------------------------------------------------------------------
-// Physical constants (placeholders -- swap in real process numbers later)
-// ---------------------------------------------------------------------------
-static const double RHO_PER_LAYER_DEFAULT = 0.05;   // ohms per square (sheet resistance placeholder)
-static const double THICKNESS_DEFAULT     = 1.0;    // placeholder metal thickness (same units as x/y)
-static const double C_GROUND_PER_AREA     = 0.0001; // placeholder ground-cap per unit area (fF/unit^2 style)
-
-// Per-layer sheet resistance placeholder table. Keyed by the same LayerType
-// values used in SegmentInterval::layer (see IntervalTree.cpp's local LayerType copy).
-double sheetResistance(unsigned int layer) {
-    switch (layer) {
-        case L_POLY: return 0.08;
-        case L_LI:   return 0.06;
-        case L_M1:   return 0.05;
-        case L_M2:   return 0.04;
-        default:     return RHO_PER_LAYER_DEFAULT;
-    }
-}
-
-string layerName(unsigned int layer) {
-    switch (layer) {
-        case L_NONE:      return "none";
-        case L_NDIFF:     return "ndiff";
-        case L_PDIFF:     return "pdiff";
-        case L_NTRANS:    return "ntransistor";
-        case L_PTRANS:    return "ptransistor";
-        case L_POLY:      return "polysilicon";
-        case L_LI:        return "li";
-        case L_M1:        return "m1";
-        case L_M2:        return "m2";
-        case L_POLYCON:   return "polycon";
-        case L_LIBRDRCON: return "librdrcon";
-        case L_MCON:      return "mcon";
-        case L_NDC:       return "ndc";
-        case L_PDC:       return "pdc";
-        default:          return "none";
-    }
-}
-
-unsigned int layerFromName(const string& name) {
-    if (name == "ndiff" || name == "ndiffusion")       return L_NDIFF;
-    if (name == "pdiff" || name == "pdiffusion")       return L_PDIFF;
-    if (name == "ntransistor")                          return L_NTRANS;
-    if (name == "ptransistor")                          return L_PTRANS;
-    if (name == "polysilicon")                          return L_POLY;
-    if (name == "li")                                   return L_LI;
-    if (name == "m1")                                   return L_M1;
-    if (name == "m2")                                   return L_M2;
-    if (name == "polycon")                              return L_POLYCON;
-    if (name == "librdrcon")                            return L_LIBRDRCON;
-    if (name == "mcon")                                 return L_MCON;
-    return L_NONE;
-}
-
-// ---------------------------------------------------------------------------
-// .rect parsing (standalone copy -- grammar matches Routing_Helpers.cpp's
-// parseRectLine, but re-implemented here with no #include of that file).
-// Grammar per line: <rect|inrect|outrect> <net> <layer> <x1> <y1> <x2> <y2>
-// Lines starting with '#' or the leading "bbox ..." header line are skipped.
-// ---------------------------------------------------------------------------
-struct RectRaw {
-    string inout;
-    string net;
-    string layer;
-    Coord x1, y1, x2, y2;
+// ---------------------------------------------------------------- coupling model
+struct Coupling {
+    double side = 0;     // same-layer sidewall coupling, fF
+    double overlap = 0;  // adjacent-layer overlap coupling, fF
+    double total() const { return side + overlap; }
 };
 
-bool parseRectLine(const string& line, RectRaw& out) {
-    if (line.empty() || line[0] == '#') return false;
+// The dielectric slab between the two facing surfaces of one contributing pair (microns).
+// Exported so the 3D visualizer can show exactly which walls a capacitance is measured across.
+struct PairGeom {
+    double x1 = 0, y1 = 0, z1 = 0, x2 = 0, y2 = 0, z2 = 0;  // slab box (x1<=x2 ...)
+    double gap = 0;     // sidewall: edge-to-edge spacing; overlap: vertical dielectric gap
+    double extent = 0;  // sidewall: parallel run length;  overlap: overlap area (um^2)
+    char axis = 'z';    // direction across which the two walls face each other: 'x', 'y' or 'z'
+    double clearRun = 0;  // sidewall: parallel run left after slab blocking (== extent if nothing blocks)
+};
 
-    stringstream ss(line);
-    string kind;
-    ss >> kind;
+struct PairRec {
+    int a = -1, b = -1;  // segment ids
+    Coupling raw;        // before slab blocking (every facing pair counted)
+    Coupling c;          // after slab blocking (what is actually accumulated)
+    PairGeom g;
+    vector<int> blockers;  // shapes sitting inside the slab
+};
 
-    if (kind == "bbox") return false; // header line from exportRect, not a shape
-    if (kind != "rect" && kind != "inrect" && kind != "outrect") return false;
+// Coupling between two shapes. Symmetric. Zero for same-net pairs.
+//  same layer     : C = eps * fringe * thickness * parallel_run / spacing   (spacing <= HALO)
+//  adjacent layer : C = eps * overlap_area / vertical_gap
+// Different-net shapes that touch/overlap on one layer (a short) are ignored.
+inline Coupling pairCoupling(const Tech& t, const Segment& a, const Segment& b, PairGeom* g = nullptr) {
+    Coupling c;
+    if (a.net == b.net) return c;
+    if (a.layer == b.layer) {
+        double sx = max(a.box.x1, b.box.x1) - min(a.box.x2, b.box.x2);  // >0: gap in x, <0: overlap in x
+        double sy = max(a.box.y1, b.box.y1) - min(a.box.y2, b.box.y2);
+        double spacing, prl;
+        bool gapInX;
+        if (sx > GEOM_EPS && sy < -GEOM_EPS) {
+            spacing = sx;
+            prl = -sy;
+            gapInX = true;
+        } else if (sy > GEOM_EPS && sx < -GEOM_EPS) {
+            spacing = sy;
+            prl = -sx;
+            gapInX = false;
+        } else {
+            return c;  // diagonal neighbours, touching, or overlapping
+        }
+        if (spacing > t.halo) return c;
+        const Layer& L = t.layers[a.layer];
+        c.side = t.eps() * t.fringe * L.thickness * prl / spacing;
+        if (g) {
+            if (gapInX) {  // slab spans the x gap, and the y overlap
+                g->x1 = min(a.box.x2, b.box.x2);
+                g->x2 = max(a.box.x1, b.box.x1);
+                g->y1 = max(a.box.y1, b.box.y1);
+                g->y2 = min(a.box.y2, b.box.y2);
+            } else {
+                g->y1 = min(a.box.y2, b.box.y2);
+                g->y2 = max(a.box.y1, b.box.y1);
+                g->x1 = max(a.box.x1, b.box.x1);
+                g->x2 = min(a.box.x2, b.box.x2);
+            }
+            g->z1 = L.zBottom;
+            g->z2 = L.zBottom + L.thickness;
+            g->gap = spacing;
+            g->extent = prl;
+            g->axis = gapInX ? 'x' : 'y';
+        }
+    } else if (abs(a.layer - b.layer) == 1) {
+        double ox = min(a.box.x2, b.box.x2) - max(a.box.x1, b.box.x1);
+        double oy = min(a.box.y2, b.box.y2) - max(a.box.y1, b.box.y1);
+        if (ox > GEOM_EPS && oy > GEOM_EPS) {
+            int lo = min(a.layer, b.layer);
+            c.overlap = t.eps() * ox * oy / t.gapAbove(lo);
+            if (g) {  // slab = overlap rectangle, between top of lower layer and bottom of upper layer
+                g->x1 = max(a.box.x1, b.box.x1);
+                g->x2 = min(a.box.x2, b.box.x2);
+                g->y1 = max(a.box.y1, b.box.y1);
+                g->y2 = min(a.box.y2, b.box.y2);
+                g->z1 = t.layers[lo].zBottom + t.layers[lo].thickness;
+                g->z2 = t.layers[lo + 1].zBottom;
+                g->gap = t.gapAbove(lo);
+                g->extent = ox * oy;
+                g->axis = 'z';
+            }
+        }
+    }
+    return c;
+}
 
-    out.inout = kind;
-    ss >> out.net >> out.layer >> out.x1 >> out.y1 >> out.x2 >> out.y2;
-    if (!ss) return false;
-    if (out.x2 <= out.x1 || out.y2 <= out.y1) return false;
+using NetPair = pair<int, int>;
+using CouplingMap = map<NetPair, Coupling>;
 
+// Finds shapes on `layer` whose box overlaps r and calls cb(id) for each (duplicates are harmless).
+// The tree extractor answers this with a quad tree query, the brute-force one with a linear scan.
+using BlockerFinder = function<void(int layer, const Rect& r, const function<void(int)>& cb)>;
+
+// Slab blocking. A same-layer shape sitting inside the slab between two facing walls (any net,
+// including the plates' own nets) intercepts the field there. Its footprint along the run
+// direction is removed from the parallel run, and C is scaled by the unblocked fraction.
+// A fully covered run contributes nothing.
+inline void applyShielding(const vector<Segment>& segs, const Segment& a, const Segment& b, PairGeom& g,
+                           Coupling& c, vector<int>& blockers, const BlockerFinder& find) {
+    g.clearRun = g.extent;
+    if (c.side <= 0) return;  // only sidewall pairs: nothing sits between adjacent layers
+    bool gapInX = (g.axis == 'x');
+    double lo = gapInX ? g.y1 : g.x1, hi = gapInX ? g.y2 : g.x2;  // run interval along the facing walls
+    Rect slab{g.x1, g.y1, g.x2, g.y2};
+    vector<pair<double, double>> iv;
+    find(a.layer, slab, [&](int id) {
+        if (id == a.id || id == b.id) return;
+        const Rect& r = segs[id].box;
+        double ox = min(r.x2, slab.x2) - max(r.x1, slab.x1);
+        double oy = min(r.y2, slab.y2) - max(r.y1, slab.y1);
+        if (ox <= GEOM_EPS || oy <= GEOM_EPS) return;  // touching only, not inside the slab
+        iv.push_back(gapInX ? make_pair(max(r.y1, lo), min(r.y2, hi)) : make_pair(max(r.x1, lo), min(r.x2, hi)));
+        blockers.push_back(id);
+    });
+    if (iv.empty()) return;
+    sort(blockers.begin(), blockers.end());
+    blockers.erase(unique(blockers.begin(), blockers.end()), blockers.end());
+    sort(iv.begin(), iv.end());
+    double covered = 0, curLo = iv[0].first, curHi = iv[0].second;  // union of blocker footprints
+    for (size_t k = 1; k < iv.size(); ++k) {
+        if (iv[k].first > curHi) {
+            covered += curHi - curLo;
+            curLo = iv[k].first;
+            curHi = iv[k].second;
+        } else {
+            curHi = max(curHi, iv[k].second);
+        }
+    }
+    covered += curHi - curLo;
+    double clear = (hi - lo) - covered;
+    if (clear <= GEOM_EPS) {
+        c.side = 0;
+        g.clearRun = 0;
+    } else {
+        c.side *= clear / (hi - lo);  // C is proportional to the run length
+        g.clearRun = clear;
+    }
+}
+
+// Evaluates one candidate pair and adds it to the map. If sink is non-null, every facing pair is
+// also recorded (including fully blocked ones, with C = 0) so the visualizer can show them.
+inline void accumulate(CouplingMap& m, const Tech& t, const vector<Segment>& segs, int i, int j,
+                       const BlockerFinder& find, vector<PairRec>* sink = nullptr) {
+    PairGeom g;
+    Coupling raw = pairCoupling(t, segs[i], segs[j], &g);
+    if (raw.total() == 0) return;
+    Coupling c = raw;
+    vector<int> blockers;
+    applyShielding(segs, segs[i], segs[j], g, c, blockers, find);
+    if (c.total() > 0) {
+        NetPair key(min(segs[i].net, segs[j].net), max(segs[i].net, segs[j].net));
+        Coupling& acc = m[key];
+        acc.side += c.side;
+        acc.overlap += c.overlap;
+    }
+    if (sink) {
+        PairRec r;
+        r.a = i;
+        r.b = j;
+        r.raw = raw;
+        r.c = c;
+        r.g = g;
+        r.blockers = blockers;
+        sink->push_back(r);
+    }
+}
+
+// ---------------------------------------------------------------- extraction
+long gTreeCandidates = 0, gBruteCandidates = 0;
+
+CouplingMap extractWithTrees(const Tech& t, const vector<Segment>& segs, vector<QuadTree>& trees,
+                             vector<PairRec>* sink = nullptr) {
+    CouplingMap m;
+    int nl = (int)trees.size();
+    BlockerFinder find = [&](int layer, const Rect& r, const function<void(int)>& cb) {
+        trees[layer].query(r, cb);
+    };
+    vector<int> cand;
+    for (const Segment& s : segs) {
+        int i = s.id;
+        cand.clear();
+        // same layer: neighbours within the halo; count each pair once (j > i)
+        trees[s.layer].query(s.box.expanded(t.halo + GEOM_EPS), [&](int j) {
+            if (j > i) cand.push_back(j);
+        });
+        // layer above: shapes overlapping this box (each cross-layer pair seen once, from the lower shape)
+        if (s.layer + 1 < nl) {
+            trees[s.layer + 1].query(s.box, [&](int j) { cand.push_back(j); });
+        }
+        // Evaluate only after the queries above have finished: slab blocking runs its own tree
+        // queries, and a tree's visit stamps are not reentrant.
+        for (int j : cand) {
+            ++gTreeCandidates;
+            accumulate(m, t, segs, i, j, find, sink);
+        }
+    }
+    return m;
+}
+
+CouplingMap extractBrute(const Tech& t, const vector<Segment>& segs) {
+    CouplingMap m;
+    BlockerFinder find = [&](int layer, const Rect& r, const function<void(int)>& cb) {
+        for (const Segment& s : segs)
+            if (s.layer == layer && overlapsClosed(s.box, r)) cb(s.id);
+    };
+    for (size_t i = 0; i < segs.size(); ++i)
+        for (size_t j = i + 1; j < segs.size(); ++j) {
+            if (abs(segs[i].layer - segs[j].layer) > 1) continue;
+            ++gBruteCandidates;
+            accumulate(m, t, segs, (int)i, (int)j, find);
+        }
+    return m;
+}
+
+bool sameResult(const CouplingMap& a, const CouplingMap& b) {
+    if (a.size() != b.size()) return false;
+    auto ia = a.begin();
+    auto ib = b.begin();
+    for (; ia != a.end(); ++ia, ++ib) {
+        if (ia->first != ib->first) return false;
+        double sa = ia->second.side, sb = ib->second.side;
+        double oa = ia->second.overlap, ob = ib->second.overlap;
+        if (fabs(sa - sb) > 1e-9 * max(1.0, fabs(sa))) return false;
+        if (fabs(oa - ob) > 1e-9 * max(1.0, fabs(oa))) return false;
+    }
     return true;
 }
 
-vector<RectRaw> loadRectFile(const string& filename) {
-    vector<RectRaw> rects;
-    ifstream fin(filename);
-    if (!fin) {
-        cerr << "Error: cannot open " << filename << "\n";
-        return rects;
+// ---------------------------------------------------------------- export
+static string jsonEsc(const string& s) {
+    string o;
+    for (char c : s) {
+        if (c == '"' || c == '\\') o += '\\';
+        o += c;
     }
-    string line;
-    while (getline(fin, line)) {
-        RectRaw r;
-        if (parseRectLine(line, r)) rects.push_back(r);
-    }
-    return rects;
+    return o;
 }
 
-// Local net-name -> id mapping (standalone copy of the router's getNetId pattern)
-unordered_map<string, unsigned int> netMap;
-vector<string> netList = {"#"};
-unsigned int nextNetId = 1;
-
-unsigned int getNetId(const string& net) {
-    if (net == "#") return 0;
-    auto it = netMap.find(net);
-    if (it != netMap.end()) return it->second;
-    netMap[net] = nextNetId;
-    netList.push_back(net);
-    return nextNetId++;
+bool writeSampex(const string& path, const Design& d, const Tech& t, const vector<QuadTree>& trees,
+                 const CouplingMap& cm, const vector<PairRec>& pairs) {
+    FILE* f = fopen(path.c_str(), "w");
+    if (!f) {
+        fprintf(stderr, "error: cannot write '%s'\n", path.c_str());
+        return false;
+    }
+    fprintf(f, "{\n\"design\":\"%s\",\n", jsonEsc(d.name).c_str());
+    fprintf(f, "\"die\":[%.6f,%.6f,%.6f,%.6f],\n", d.die.x1, d.die.y1, d.die.x2, d.die.y2);
+    fprintf(f, "\"layers\":[");
+    for (size_t i = 0; i < t.layers.size(); ++i)
+        fprintf(f, "%s\"%s\"", i ? "," : "", jsonEsc(t.layers[i].name).c_str());
+    fprintf(f, "],\n\"layer_z\":[");  // [z_bottom, thickness] per layer, same order as "layers"
+    for (size_t i = 0; i < t.layers.size(); ++i)
+        fprintf(f, "%s[%.6f,%.6f]", i ? "," : "", t.layers[i].zBottom, t.layers[i].thickness);
+    fprintf(f, "],\n\"halo\":%.6f,\n\"nets\":[", t.halo);
+    for (size_t i = 0; i < d.netNames.size(); ++i)
+        fprintf(f, "%s{\"name\":\"%s\",\"supply\":%s}", i ? "," : "", jsonEsc(d.netNames[i]).c_str(),
+                d.netIsSupply[i] ? "true" : "false");
+    fprintf(f, "],\n\"segments\":[\n");
+    for (size_t i = 0; i < d.segs.size(); ++i) {
+        const Segment& s = d.segs[i];
+        fprintf(f, "%s{\"id\":%d,\"net\":%d,\"layer\":%d,\"via\":%s,\"llx\":%.6f,\"lly\":%.6f,\"wx\":%.6f,\"wy\":%.6f}",
+                i ? ",\n" : "", s.id, s.net, s.layer, s.isVia ? "true" : "false", s.box.x1, s.box.y1,
+                s.box.w(), s.box.h());
+    }
+    fprintf(f, "\n],\n\"trees\":[\n");
+    for (size_t i = 0; i < trees.size(); ++i) {
+        fprintf(f, "%s{\"layer\":%zu,\"nodes\":", i ? ",\n" : "", i);
+        trees[i].writeNodesJson(f);
+        fprintf(f, "}");
+    }
+    fprintf(f, "\n],\n\"coupling\":[");
+    bool first = true;
+    for (auto& kv : cm) {
+        fprintf(f, "%s{\"a\":%d,\"b\":%d,\"side_fF\":%.9g,\"overlap_fF\":%.9g}", first ? "" : ",",
+                kv.first.first, kv.first.second, kv.second.side, kv.second.overlap);
+        first = false;
+    }
+    // One entry per contributing shape pair: which two shapes, what kind, and the slab between them
+    fprintf(f, "],\n\"pairs\":[\n");
+    for (size_t i = 0; i < pairs.size(); ++i) {
+        const PairRec& r = pairs[i];
+        bool side = r.raw.side > 0;  // classify from the raw value: a fully blocked pair has final C = 0
+        fprintf(f,
+                "%s{\"a\":%d,\"b\":%d,\"type\":\"%s\",\"fF\":%.9g,\"raw_fF\":%.9g,\"gap\":%.6f,\"extent\":%.6f,"
+                "\"clear\":%.6f,\"axis\":\"%c\",\"box\":[%.6f,%.6f,%.6f,%.6f,%.6f,%.6f],\"blockers\":[",
+                i ? ",\n" : "", r.a, r.b, side ? "side" : "overlap", r.c.total(), r.raw.total(), r.g.gap,
+                r.g.extent, r.g.clearRun, r.g.axis, r.g.x1, r.g.y1, r.g.z1, r.g.x2, r.g.y2, r.g.z2);
+        for (size_t k = 0; k < r.blockers.size(); ++k) fprintf(f, "%s%d", k ? "," : "", r.blockers[k]);
+        fprintf(f, "]}");
+    }
+    fprintf(f, "\n]\n}\n");
+    fclose(f);
+    return true;
 }
 
-// ---------------------------------------------------------------------------
-// Sweep event structure
-// ---------------------------------------------------------------------------
-enum class EventType { INSERT, DELETE };
-
-struct SweepEvent {
-    Coord x;
-    EventType type;
-    uint32_t seg_id;
-};
-
-// Per-segment computed results, filled in after the sweep
-struct SegmentResult {
-    uint32_t id;
-    unsigned int net_id;
-    unsigned int layer;
-    Coord x_lo, x_hi, y_lo, y_hi;
-    double resistance;
-    double cap_ground;
-};
-
-// Per-net aggregated results, computed from all segments sharing a net_id.
-//
-// cap_ground_total is exact for stage 1: ground capacitors from independent
-// segments simply add in parallel, regardless of how the segments connect.
-//
-// resistance_total is NOT a true net resistance -- it is the flat sum of every
-// segment's resistance on this net, as if they were all in series. We have no
-// connectivity/adjacency information in this file (no corner-stitch, no via
-// graph), so a topologically-correct series/parallel reduction isn't possible
-// here. Treat resistance_total as a rough upper-bound/sanity number only.
-struct NetResult {
-    unsigned int net_id;
-    string net_name;
-    int segment_count;
-    double resistance_total;   // naive sum -- see note above, NOT series-correct
-    double cap_ground_total;   // exact -- ground caps add in parallel regardless of topology
-};
-
-// One recorded step of the sweep, for the visualizer
-struct SweepStep {
-    Coord x;
-    EventType type;
-    uint32_t seg_id;
-    vector<uint32_t> active_ids;
-};
-
-// ---------------------------------------------------------------------------
-// Flat per-segment R/C math (stage 1: no tree query needed, ground is a
-// uniform plane so this is pure per-segment geometry -- see design discussion).
-// ---------------------------------------------------------------------------
-double computeResistance(const SegmentInterval& seg) {
-    double length = static_cast<double>(seg.x_hi - seg.x_lo);
-    double width  = static_cast<double>(seg.y_hi - seg.y_lo);
-    if (width <= 0.0) return 0.0;
-    double rho = sheetResistance(seg.layer);
-    return rho * length / width;
-}
-
-double computeGroundCap(const SegmentInterval& seg) {
-    double length = static_cast<double>(seg.x_hi - seg.x_lo);
-    double width  = static_cast<double>(seg.y_hi - seg.y_lo);
-    double area = length * width;
-    return area * C_GROUND_PER_AREA;
-}
-
-// ---------------------------------------------------------------------------
-// Per-net aggregation (see NetResult comment above for the resistance caveat)
-// ---------------------------------------------------------------------------
-vector<NetResult> aggregateByNet(const vector<SegmentResult>& results, const vector<string>& netList) {
-    map<unsigned int, NetResult> byNet; // map (not unordered_map) so output is net_id-sorted
-
-    for (const auto& r : results) {
-        auto it = byNet.find(r.net_id);
-        if (it == byNet.end()) {
-            NetResult n;
-            n.net_id = r.net_id;
-            n.net_name = (r.net_id < netList.size()) ? netList[r.net_id] : "?";
-            n.segment_count = 0;
-            n.resistance_total = 0.0;
-            n.cap_ground_total = 0.0;
-            it = byNet.emplace(r.net_id, n).first;
-        }
-        it->second.segment_count += 1;
-        it->second.resistance_total += r.resistance;
-        it->second.cap_ground_total += r.cap_ground;
-    }
-
-    vector<NetResult> out;
-    out.reserve(byNet.size());
-    for (auto& [id, n] : byNet) out.push_back(n);
-    return out;
-}
-
-void printNetSummary(const vector<NetResult>& nets) {
-    cout << "\n--- Per-net PEX summary (stage 1: ground cap only, no coupling) ---\n";
-    cout << "NOTE: resistance_total is a naive sum of all segments on the net,\n";
-    cout << "      not a topologically-correct series/parallel value (no\n";
-    cout << "      connectivity info available at this stage).\n\n";
-    cout << left << setw(10) << "net"
-         << right << setw(8) << "segs"
-         << setw(16) << "R_total (ohm)"
-         << setw(18) << "C_ground_total"
-         << "\n";
-    for (const auto& n : nets) {
-        cout << left << setw(10) << n.net_name
-             << right << setw(8) << n.segment_count
-             << setw(16) << n.resistance_total
-             << setw(18) << n.cap_ground_total
-             << "\n";
-    }
-    cout << "\n";
-}
-
-// ---------------------------------------------------------------------------
-// .sampex export
-// ---------------------------------------------------------------------------
-void exportSampex(
-    const string& filename,
-    const vector<SegmentResult>& results,
-    const vector<SweepStep>& sweep,
-    const vector<NetResult>& nets
-) {
-    ofstream fout(filename);
-    if (!fout) {
-        cerr << "Error: cannot open " << filename << " for writing\n";
-        return;
-    }
-
-    fout << "{\n";
-
-    // ---- segments ----
-    fout << "  \"segments\": [\n";
-    for (size_t i = 0; i < results.size(); i++) {
-        const auto& r = results[i];
-        fout << "    {"
-             << "\"id\":" << r.id << ","
-             << "\"net\":" << r.net_id << ","
-             << "\"layer\":\"" << layerName(r.layer) << "\","
-             << "\"x_lo\":" << r.x_lo << ","
-             << "\"x_hi\":" << r.x_hi << ","
-             << "\"y_lo\":" << r.y_lo << ","
-             << "\"y_hi\":" << r.y_hi << ","
-             << "\"resistance\":" << r.resistance << ","
-             << "\"cap_ground\":" << r.cap_ground
-             << "}";
-        if (i + 1 < results.size()) fout << ",";
-        fout << "\n";
-    }
-    fout << "  ],\n";
-
-    // ---- nets ----
-    fout << "  \"nets\": [\n";
-    for (size_t i = 0; i < nets.size(); i++) {
-        const auto& n = nets[i];
-        fout << "    {"
-             << "\"net_id\":" << n.net_id << ","
-             << "\"net_name\":\"" << n.net_name << "\","
-             << "\"segment_count\":" << n.segment_count << ","
-             << "\"resistance_total\":" << n.resistance_total << ","
-             << "\"cap_ground_total\":" << n.cap_ground_total
-             << "}";
-        if (i + 1 < nets.size()) fout << ",";
-        fout << "\n";
-    }
-    fout << "  ],\n";
-
-    // ---- sweep ----
-    fout << "  \"sweep\": [\n";
-    for (size_t i = 0; i < sweep.size(); i++) {
-        const auto& s = sweep[i];
-        fout << "    {"
-             << "\"x\":" << s.x << ","
-             << "\"event\":\"" << (s.type == EventType::INSERT ? "insert" : "delete") << "\","
-             << "\"seg_id\":" << s.seg_id << ","
-             << "\"active\":[";
-        for (size_t j = 0; j < s.active_ids.size(); j++) {
-            fout << s.active_ids[j];
-            if (j + 1 < s.active_ids.size()) fout << ",";
-        }
-        fout << "]}";
-        if (i + 1 < sweep.size()) fout << ",";
-        fout << "\n";
-    }
-    fout << "  ]\n";
-
-    fout << "}\n";
-}
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------- main
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        cerr << "Usage: ./PexTest <file.rect> [output.sampex]\n";
+    string defPath = argc > 1 ? argv[1] : "test.def";
+    string techPath = argc > 2 ? argv[2] : "tech.cfg";
+    string outPath = argc > 3 ? argv[3] : "out.sampex";
+
+    Tech tech;
+    if (!loadTech(techPath, tech)) return 1;
+
+    Design design;
+    DefParser parser(tech, design);
+    if (!parser.parseFile(defPath)) return 1;
+    if (design.segs.empty()) {
+        fprintf(stderr, "error: no routing shapes found on tech layers\n");
         return 1;
     }
 
-    string inputFile = argv[1];
-    string outputFile = (argc >= 3) ? argv[2] : "output.sampex";
+    // Tree bounds: die area united with every shape (shapes may stick out of the die)
+    Rect bounds = design.die;
+    for (const Segment& s : design.segs) {
+        bounds.x1 = min(bounds.x1, s.box.x1);
+        bounds.y1 = min(bounds.y1, s.box.y1);
+        bounds.x2 = max(bounds.x2, s.box.x2);
+        bounds.y2 = max(bounds.y2, s.box.y2);
+    }
+    bounds = bounds.expanded(0.01);
 
-    vector<RectRaw> rawRects = loadRectFile(inputFile);
-    if (rawRects.empty()) {
-        cerr << "Warning: no valid rectangles parsed from " << inputFile << "\n";
+    printf("Design %s: %zu nets, %zu shapes, %zu layers, dbu=%g\n", design.name.c_str(), design.netNames.size(),
+           design.segs.size(), tech.layers.size(), design.dbu);
+
+    vector<QuadTree> trees;
+    for (size_t L = 0; L < tech.layers.size(); ++L) trees.emplace_back(bounds, &design.segs, 8, 10);
+    for (const Segment& s : design.segs) trees[s.layer].insert(s.id);
+
+    printf("\nQuad tree stats (capacity 8, max depth 10):\n");
+    for (size_t L = 0; L < trees.size(); ++L) {
+        auto st = trees[L].stats();
+        printf("  %-6s nodes=%d leaves=%d maxDepth=%d avg/leaf=%.2f max/leaf=%d dupFactor=%.2f\n",
+               tech.layers[L].name.c_str(), st.nodes, st.leaves, st.maxDepth, st.avgPerLeaf, st.maxPerLeaf,
+               st.dupFactor);
     }
 
-    // Build SegmentIntervals, one per rectangle, with a unique segment_id
-    vector<SegmentInterval> segments;
-    segments.reserve(rawRects.size());
-    for (size_t i = 0; i < rawRects.size(); i++) {
-        const auto& r = rawRects[i];
-        SegmentInterval seg;
-        seg.x_lo = r.x1;
-        seg.x_hi = r.x2;
-        seg.y_lo = r.y1;
-        seg.y_hi = r.y2;
-        seg.layer = layerFromName(r.layer);
-        seg.net_id = getNetId(r.net);
-        seg.segment_id = static_cast<uint32_t>(i);
-        segments.push_back(seg);
+    auto t0 = chrono::steady_clock::now();
+    vector<PairRec> pairRecs;
+    CouplingMap viaTree = extractWithTrees(tech, design.segs, trees, &pairRecs);
+    auto t1 = chrono::steady_clock::now();
+    CouplingMap brute = extractBrute(tech, design.segs);
+    auto t2 = chrono::steady_clock::now();
+
+    bool ok = sameResult(viaTree, brute);
+    printf("\nValidation vs brute force: %s\n", ok ? "PASS (identical)" : "FAIL (mismatch!)");
+    printf("  candidate pairs evaluated: tree=%ld  brute=%ld\n", gTreeCandidates, gBruteCandidates);
+    printf("  time: tree=%.3f ms  brute=%.3f ms\n", chrono::duration<double, milli>(t1 - t0).count(),
+           chrono::duration<double, milli>(t2 - t1).count());
+
+    // Table, largest first
+    vector<pair<NetPair, Coupling>> rows(viaTree.begin(), viaTree.end());
+    sort(rows.begin(), rows.end(), [](auto& a, auto& b) { return a.second.total() > b.second.total(); });
+    printf("\nCoupling capacitance per net pair (fF)   [* = involves a supply net]\n");
+    printf("  %-8s %-8s %12s %12s %12s\n", "netA", "netB", "sidewall", "overlap", "total");
+    for (auto& r : rows) {
+        bool sup = design.netIsSupply[r.first.first] || design.netIsSupply[r.first.second];
+        printf("  %-8s %-8s %12.6f %12.6f %12.6f %s\n", design.netNames[r.first.first].c_str(),
+               design.netNames[r.first.second].c_str(), r.second.side, r.second.overlap, r.second.total(),
+               sup ? "*" : "");
     }
 
-    // Build sweep events: INSERT at x_lo, DELETE at x_hi
-    vector<SweepEvent> events;
-    events.reserve(segments.size() * 2);
-    for (const auto& seg : segments) {
-        events.push_back({seg.x_lo, EventType::INSERT, seg.segment_id});
-        events.push_back({seg.x_hi, EventType::DELETE, seg.segment_id});
+    // What slab blocking changed: raw = every facing pair counted (the old behaviour)
+    map<NetPair, double> rawSum;
+    int fullyBlocked = 0, partlyBlocked = 0;
+    for (const PairRec& r : pairRecs) {
+        rawSum[NetPair(min(design.segs[r.a].net, design.segs[r.b].net),
+                       max(design.segs[r.a].net, design.segs[r.b].net))] += r.raw.total();
+        if (r.raw.total() > 0 && r.c.total() == 0) ++fullyBlocked;
+        else if (r.c.total() < r.raw.total() * (1 - 1e-12)) ++partlyBlocked;
     }
-
-    // Sort by x; at equal x, INSERT before DELETE so a segment ending exactly
-    // where another begins doesn't cause a false momentary gap in the active set.
-    sort(events.begin(), events.end(), [](const SweepEvent& a, const SweepEvent& b) {
-        if (a.x != b.x) return a.x < b.x;
-        if (a.type != b.type) return a.type == EventType::INSERT;
-        return a.seg_id < b.seg_id;
-    });
-
-    // Run the sweep
-    IntervalTree tree;
-    unordered_map<uint32_t, IntervalTree::Handle> handles;
-    vector<SweepStep> sweepLog;
-    sweepLog.reserve(events.size());
-
-    for (const auto& ev : events) {
-        if (ev.type == EventType::INSERT) {
-            const SegmentInterval& seg = segments[ev.seg_id];
-            handles[ev.seg_id] = tree.insert(seg);
-        } else {
-            auto it = handles.find(ev.seg_id);
-            if (it != handles.end()) {
-                tree.erase(it->second);
-                handles.erase(it);
-            }
-        }
-
-        SweepStep step;
-        step.x = ev.x;
-        step.type = ev.type;
-        step.seg_id = ev.seg_id;
-        for (const auto& active : tree.activeSet()) {
-            step.active_ids.push_back(active.segment_id);
-        }
-        sweepLog.push_back(step);
+    printf("\nSlab blocking (raw = every facing pair counted; final = blocked runs removed):\n");
+    printf("  %-8s %-8s %12s %12s %9s\n", "netA", "netB", "raw", "final", "removed");
+    for (auto& r : rows) {
+        double raw = rawSum[r.first];
+        printf("  %-8s %-8s %12.6f %12.6f %8.1f%%\n", design.netNames[r.first.first].c_str(),
+               design.netNames[r.first.second].c_str(), raw, r.second.total(),
+               raw > 0 ? 100.0 * (raw - r.second.total()) / raw : 0.0);
     }
+    printf("  pairs fully blocked: %d, partly blocked: %d, total facing pairs: %zu\n", fullyBlocked, partlyBlocked,
+           pairRecs.size());
 
-    // Compute flat per-segment R and ground-C (stage 1 -- no tree query needed)
-    vector<SegmentResult> results;
-    results.reserve(segments.size());
-    for (const auto& seg : segments) {
-        SegmentResult r;
-        r.id = seg.segment_id;
-        r.net_id = seg.net_id;
-        r.layer = seg.layer;
-        r.x_lo = seg.x_lo;
-        r.x_hi = seg.x_hi;
-        r.y_lo = seg.y_lo;
-        r.y_hi = seg.y_hi;
-        r.resistance = computeResistance(seg);
-        r.cap_ground = computeGroundCap(seg);
-        results.push_back(r);
-    }
-
-    // Aggregate per-net R/C (see NetResult comment for the resistance caveat)
-    vector<NetResult> netResults = aggregateByNet(results, netList);
-
-    exportSampex(outputFile, results, sweepLog, netResults);
-
-    cout << "Parsed " << segments.size() << " segments from " << inputFile << "\n";
-    cout << "Ran " << events.size() << " sweep events\n";
-    cout << "Wrote " << outputFile << "\n";
-
-    printNetSummary(netResults);
-
-    return 0;
+    printf("\nContributing shape pairs recorded: %zu\n", pairRecs.size());
+    if (writeSampex(outPath, design, tech, trees, viaTree, pairRecs)) printf("\nWrote %s\n", outPath.c_str());
+    return ok ? 0 : 2;
 }
-
-// ToDo: Add VIA Resistance cost as well

@@ -1,255 +1,121 @@
-#!/usr/bin/env python3
-"""
-Visualizer.py
-
-Debug visualizer for .sampex files produced by Pex_Test.cpp.
-
-Three views:
-  1. Static layout  -- all segments drawn as rectangles, colored by layer.
-                        Good for sanity-checking parsing.
-  2. Sweep animation -- steps through the sweep log, drawing a vertical
-                        sweep-line at the event's x, and highlighting the
-                        currently-active segment set. Good for debugging
-                        the IntervalTree insert/erase sequence itself.
-  3. Net view        -- given a net name, shows only that net's segments
-                        (across all layers -- net_id is shared across layers
-                        by vias/contacts, so this doesn't need separate via
-                        data, it just filters by net_id). Each segment is
-                        labeled with its area, so R/C values in the .sampex
-                        can be sanity-checked at a glance against geometry.
-
-Usage:
-    python3 Visualizer.py <file.sampex>                 # static layout
-    python3 Visualizer.py <file.sampex> --animate        # sweep animation
-    python3 Visualizer.py <file.sampex> --net Y          # net view for net "Y"
-"""
-
-import argparse
 import json
 import sys
+from matplotlib import pyplot as plt
+from matplotlib.patches import Rectangle, Patch
 
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-import matplotlib.animation as animation
+# ---------- CONFIG ----------
+SAMPEX_FILE = sys.argv[1] if len(sys.argv) > 1 else "out.sampex"
+OUT_PDF = "layout_tree.pdf"
 
-Use_Gray_Nets = False
+Show_segments = True
+Show_tree = True
+Show_internal_nodes = False     # also draw non-leaf quadrants
+Shade_leaves_by_count = True    # leaf fill intensity ~ number of segment ids stored
+Show_net_names = True
+Layer_filter = None             # e.g. ["li1"] to show only some layers; None = all
+Tree_layer_filter = None        # layers whose trees are drawn; None = same as Layer_filter
+Highlight_net = None            # e.g. "out": dim every other net
+Zoom_to_fit = True
+Legend = True
+Grid = False
 
-# Fixed layer -> color mapping so colors stay consistent across runs/files.
-LAYER_COLORS = {
-    "ndiff":       "#8dd35f",
-    "pdiff":       "#e8a33d",
-    "ntransistor": "#4f9d3d",
-    "ptransistor": "#b4741f",
-    "polysilicon": "#d9455f",
-    "li":          "#3d8fe8",
-    "m1":          "#e0c93d",
-    "m2":          "#9d3de8",
-    "polycon":     "#555555",
-    "librdrcon":   "#777777",
-    "mcon":        "#999999",
-    "ndc":         "#333333",
-    "pdc":         "#333333",
-    "none":        "#cccccc",
-}
-
-
-def load_sampex(path):
-    with open(path, "r") as f:
-        data = json.load(f)
-    segments = data.get("segments", [])
-    sweep = data.get("sweep", [])
-    nets = data.get("nets", [])
-    return segments, sweep, nets
-
-
+# ---------- COLOR MAP ----------
 def layer_color(layer):
-    return LAYER_COLORS.get(layer, "#cccccc")
+    layer = layer.lower()
+    if layer == "li1":
+        return "#ECBA6F"
+    if layer.startswith("met"):
+        return "purple"
+    if layer == "poly":
+        return "red"
+    return "gray"
 
+# ---------- LOAD ----------
+with open(SAMPEX_FILE) as f:
+    data = json.load(f)
 
-def compute_bounds(segments):
-    if not segments:
-        return (0, 1, 0, 1)
-    x_lo = min(s["x_lo"] for s in segments)
-    x_hi = max(s["x_hi"] for s in segments)
-    y_lo = min(s["y_lo"] for s in segments)
-    y_hi = max(s["y_hi"] for s in segments)
-    pad_x = max(1, (x_hi - x_lo) * 0.05)
-    pad_y = max(1, (y_hi - y_lo) * 0.05)
-    return (x_lo - pad_x, x_hi + pad_x, y_lo - pad_y, y_hi + pad_y)
+layers = data["layers"]
+nets = data["nets"]
+segs = data["segments"]
+trees = {t["layer"]: t["nodes"] for t in data["trees"]}
 
+def layer_shown(idx):
+    return Layer_filter is None or layers[idx] in Layer_filter
 
-def segment_area(seg):
-    return (seg["x_hi"] - seg["x_lo"]) * (seg["y_hi"] - seg["y_lo"])
+def tree_shown(idx):
+    flt = Tree_layer_filter if Tree_layer_filter is not None else Layer_filter
+    return flt is None or layers[idx] in flt
 
+# ---------- PLOT ----------
+fig, ax = plt.subplots(figsize=(9, 9))
 
-def draw_segment(ax, seg, facecolor, edgecolor="black", alpha=0.7, linewidth=0.8):
-    w = seg["x_hi"] - seg["x_lo"]
-    h = seg["y_hi"] - seg["y_lo"]
-    rect = patches.Rectangle(
-        (seg["x_lo"], seg["y_lo"]), w, h,
-        facecolor=facecolor, edgecolor=edgecolor,
-        alpha=alpha, linewidth=linewidth,
-    )
-    ax.add_patch(rect)
+if Show_segments:
+    for s in segs:
+        if not layer_shown(s["layer"]):
+            continue
+        lname = layers[s["layer"]]
+        net_name = nets[s["net"]]["name"]
+        dim = Highlight_net is not None and net_name != Highlight_net
+        ax.add_patch(Rectangle(
+            (s["llx"], s["lly"]), s["wx"], s["wy"],
+            facecolor=layer_color(lname),
+            edgecolor=layer_color(lname),
+            linewidth=0.5,
+            alpha=0.15 if dim else (0.55 if s["layer"] == 0 else 0.45),
+            hatch="xxxx" if s["via"] else None,
+            zorder=10 + s["layer"],
+        ))
+        if Show_net_names and not dim:
+            ax.text(s["llx"] + s["wx"] / 2, s["lly"] + s["wy"] / 2, net_name,
+                    ha="center", va="center", fontsize=6, color="black", zorder=30)
 
-
-def plot_static(segments, title="PEX Layout"):
-    fig, ax = plt.subplots(figsize=(10, 10))
-    x_lo, x_hi, y_lo, y_hi = compute_bounds(segments)
-
-    for seg in segments:
-        draw_segment(ax, seg, layer_color(seg["layer"]))
-
-    # Legend: one entry per layer actually present
-    present_layers = sorted({seg["layer"] for seg in segments})
-    handles = [
-        patches.Patch(facecolor=layer_color(l), edgecolor="black", label=l)
-        for l in present_layers
-    ]
-    ax.legend(handles=handles, loc="upper right", fontsize=8, framealpha=0.9)
-
-    ax.set_xlim(x_lo, x_hi)
-    ax.set_ylim(y_lo, y_hi)
-    ax.set_aspect("equal")
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_title(title)
-    plt.tight_layout()
-    return fig, ax
-
-
-def plot_sweep_animation(segments, sweep, interval_ms=300):
-    if not sweep:
-        print("No sweep events found in this .sampex file -- nothing to animate.")
-        return
-
-    seg_by_id = {s["id"]: s for s in segments}
-    x_lo, x_hi, y_lo, y_hi = compute_bounds(segments)
-
-    fig, ax = plt.subplots(figsize=(10, 10))
-
-    def draw_frame(step_idx):
-        ax.clear()
-        step = sweep[step_idx]
-
-        for seg in segments:
-            if Use_Gray_Nets:
-                draw_segment(ax, seg, "#dddddd", alpha=1.0, edgecolor="#bbbbbb", linewidth=0.5)
-            else:
-                draw_segment(ax, seg, layer_color(seg["layer"]), alpha=0.15, edgecolor="none")
-
-        # Highlight the currently active set in full, correct layer color
-        for seg_id in step["active"]:
-            seg = seg_by_id.get(seg_id)
-            if seg is None:
+if Show_tree:
+    cmap = plt.get_cmap("Blues")
+    for li, nodes in trees.items():
+        if not tree_shown(li):
+            continue
+        max_n = max([n["n"] for n in nodes if n["leaf"]] + [1])
+        for n in nodes:
+            if not n["leaf"] and not Show_internal_nodes:
                 continue
-            draw_segment(ax, seg, layer_color(seg["layer"]), alpha=0.9, edgecolor="black", linewidth=1.2)
+            face = "none"
+            if Shade_leaves_by_count and n["leaf"] and n["n"] > 0:
+                face = cmap(0.15 + 0.7 * n["n"] / max_n)
+            ax.add_patch(Rectangle(
+                (n["llx"], n["lly"]), n["wx"], n["wy"],
+                facecolor=face,
+                edgecolor="dimgray",
+                linewidth=0.4,
+                alpha=0.25 if face != "none" else 1.0,
+                zorder=1,
+            ))
 
-        # Draw the sweep line itself
-        ax.axvline(x=step["x"], color="red", linewidth=1.5, linestyle="--")
+# ---------- AXES ----------
+die = data["die"]
+ax.set_aspect("equal", adjustable="box")
+ax.set_xlabel("x (um)")
+ax.set_ylabel("y (um)")
+ax.set_title(f"{data['design']}: segments + quad tree leaves")
+if Grid:
+    ax.grid(True, linestyle=":", linewidth=0.5)
 
-        ax.set_xlim(x_lo, x_hi)
-        ax.set_ylim(y_lo, y_hi)
-        ax.set_aspect("equal")
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
-        ax.set_title(
-            f"Sweep step {step_idx + 1}/{len(sweep)}  |  x={step['x']}  "
-            f"{step['event']} seg {step['seg_id']}  |  active={step['active']}"
-        )
+if Zoom_to_fit and segs:
+    xs = [s["llx"] for s in segs] + [s["llx"] + s["wx"] for s in segs]
+    ys = [s["lly"] for s in segs] + [s["lly"] + s["wy"] for s in segs]
+    pad = 0.1
+    ax.set_xlim(min(xs) - pad, max(xs) + pad)
+    ax.set_ylim(min(ys) - pad, max(ys) + pad)
+else:
+    ax.set_xlim(die[0] - 0.1, die[2] + 0.1)
+    ax.set_ylim(die[1] - 0.1, die[3] + 0.1)
 
-    anim = animation.FuncAnimation(
-        fig, draw_frame, frames=len(sweep), interval=interval_ms, repeat=True
-    )
-    plt.tight_layout()
-    plt.show()
+if Legend:
+    handles = [Patch(facecolor=layer_color(l), alpha=0.5, label=l)
+               for i, l in enumerate(layers) if layer_shown(i)]
+    if Show_tree:
+        handles.append(Patch(facecolor="none", edgecolor="dimgray", label="quad tree leaf"))
+    ax.legend(handles=handles, title="Layers", loc="upper left",
+              bbox_to_anchor=(1.02, 1), frameon=True)
 
-
-def plot_net(segments, net_name, nets_summary=None):
-    net_segments = [s for s in segments if str(s["net"]) == net_name]
-
-    if not net_segments:
-        # net_name might be a name string but "net" field in segments is a
-        # numeric id -- try resolving via the nets summary if present.
-        if nets_summary:
-            match = next((n for n in nets_summary if n["net_name"] == net_name), None)
-            if match:
-                net_segments = [s for s in segments if s["net"] == match["net_id"]]
-
-    if not net_segments:
-        print(f"No segments found for net '{net_name}'.", file=sys.stderr)
-        print("Available nets:", sorted({s["net"] for s in segments}), file=sys.stderr)
-        return
-
-    fig, ax = plt.subplots(figsize=(10, 10))
-
-    for seg in segments:
-        if Use_Gray_Nets:
-            draw_segment(ax, seg, "#dddddd", alpha=1.0, edgecolor="#bbbbbb", linewidth=0.5)
-        else:
-            draw_segment(ax, seg, layer_color(seg["layer"]), alpha=0.15, edgecolor="none")
-
-    total_area = 0
-    for seg in net_segments:
-        area = segment_area(seg)
-        total_area += area
-        draw_segment(ax, seg, layer_color(seg["layer"]), alpha=0.85, edgecolor="black", linewidth=1.2)
-
-        cx = (seg["x_lo"] + seg["x_hi"]) / 2
-        cy = (seg["y_lo"] + seg["y_hi"]) / 2
-        label = f"A={area}"
-        if "resistance" in seg:
-            label += f"\nR={seg['resistance']:.3g}"
-        if "cap_ground" in seg:
-            label += f"\nC={seg['cap_ground']:.3g}"
-        ax.text(cx, cy, label, ha="center", va="center", fontsize=6.5,
-                 bbox=dict(boxstyle="round,pad=0.15", facecolor="white", alpha=0.75, edgecolor="none"))
-
-    x_lo, x_hi, y_lo, y_hi = compute_bounds(segments)
-    ax.set_xlim(x_lo, x_hi)
-    ax.set_ylim(y_lo, y_hi)
-    ax.set_aspect("equal")
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-
-    present_layers = sorted({seg["layer"] for seg in net_segments})
-    handles = [
-        patches.Patch(facecolor=layer_color(l), edgecolor="black", label=l)
-        for l in present_layers
-    ]
-    ax.legend(handles=handles, loc="upper right", fontsize=8, framealpha=0.9)
-
-    title = f"Net '{net_name}'  |  {len(net_segments)} segments  |  total area={total_area}"
-    if nets_summary:
-        match = next((n for n in nets_summary if str(n["net_id"]) == net_name or n["net_name"] == net_name), None)
-        if match:
-            title += f"\nR_total={match['resistance_total']:.4g}  C_ground_total={match['cap_ground_total']:.4g}"
-    ax.set_title(title, fontsize=10)
-
-    plt.tight_layout()
-    plt.show()
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Visualize a .sampex PEX debug file.")
-    parser.add_argument("sampex_file", help="Path to the .sampex file")
-    parser.add_argument("--animate", action="store_true", help="Show the sweep-line animation")
-    parser.add_argument("--interval", type=int, default=300, help="Animation frame interval in ms (default: 300)")
-    parser.add_argument("--net", metavar="NET_NAME_OR_ID", help="Show only the segments belonging to this net (across all layers), with per-segment area/R/C labels")
-    args = parser.parse_args()
-
-    segments, sweep, nets = load_sampex(args.sampex_file)
-    if not segments:
-        print(f"Warning: no segments found in {args.sampex_file}", file=sys.stderr)
-
-    if args.net is not None:
-        plot_net(segments, args.net, nets_summary=nets)
-    elif args.animate:
-        plot_sweep_animation(segments, sweep, interval_ms=args.interval)
-    else:
-        plot_static(segments, title=args.sampex_file)
-        plt.show()
-
-
-if __name__ == "__main__":
-    main()
+plt.savefig(OUT_PDF, bbox_inches="tight", facecolor="white", format="pdf")
+plt.show()

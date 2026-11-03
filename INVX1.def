@@ -1,0 +1,64 @@
+VERSION 5.7 ;
+   NAMESCASESENSITIVE ON ;
+   DIVIDERCHAR "/" ;
+   BUSBITCHARS "()" ;
+   DESIGN INVX1 ;
+   TECHNOLOGY sky130A ;
+   UNITS DISTANCE MICRONS 1000 ;
+   DIEAREA ( -1880 260 ) ( 440 3270 ) ;
+
+VIAS 2 ;
+   - mcon_170_240
+      + RECT li1 ( -85 -120 ) ( 85 120 )
+      + RECT met1 ( -115 -150 ) ( 115 150 )
+      + RECT mcon ( -85 -85 ) ( 85 85 ) ;
+   - mcon_170_220
+      + RECT li1 ( -85 -110 ) ( 85 110 )
+      + RECT met1 ( -115 -140 ) ( 115 140 )
+      + RECT mcon ( -85 -85 ) ( 85 85 ) ;
+END VIAS
+
+COMPONENTS 0 ;
+END COMPONENTS
+
+PINS 0 ;
+END PINS
+
+SPECIALNETS 4 ;
+   - out
+      + ROUTED li1 120  ( -200 1060 ) ( 100 * )
+      NEW li1 170  ( -95 1120 ) ( * 1730 )
+      NEW li1 220  ( -110 1730 ) ( * 2160 )
+      NEW li1 30  ( -205 2160 ) ( * 2330 )
+      NEW li1 220  ( -110 2330 ) ( * 2910 )
+      NEW li1 20  ( -10 2160 ) ( * 2330 )
+      NEW li1 90  ( 55 870 ) ( * 1000 )
+      NEW li1 40  ( 10 850 ) ( 440 * )
+      NEW li1 130  ( -200 765 ) ( 440 * )
+      NEW li1 40  ( -180 830 ) ( * 1000 ) ;
+   - in
+      + ROUTED li1 120  ( -1880 1470 ) ( -1510 * )
+      NEW li1 110  ( -1565 1240 ) ( * 1410 )
+      NEW li1 120  ( -1880 1180 ) ( -1510 * )
+      NEW li1 90  ( -1835 1240 ) ( * 1410 )
+      NEW li1 140  ( -1780 1050 ) ( -1610 * ) ;
+   - vdd
+      + ROUTED nwell 1590  ( -565 1490 ) ( * 3120 ) ;
+   - gnd
+      + ROUTED li1 10  ( -1050 1005 ) ( -660 * )
+      NEW li1 110  ( -1050 1065 ) ( -450 * )
+      NEW li1 40  ( -470 840 ) ( * 1010 )
+      NEW li1 10  ( -840 835 ) ( -450 * )
+      NEW li1 160  ( -840 920 ) ( -660 * )
+      NEW li1 130  ( -1050 765 ) ( -450 * )
+      NEW li1 40  ( -1030 830 ) ( * 1000 )
+      NEW li1 170  ( -875 510 ) ( * 700 )
+      NEW li1 170  ( -875 400 ) mcon_170_220 
+      NEW met1 40  ( -1050 530 ) ( 440 * )
+      NEW met1 220  ( -790 400 ) ( 440 * )
+      NEW met1 30  ( -1050 275 ) ( 440 * )
+      NEW met1 90  ( -1005 290 ) ( * 510 ) ;
+END SPECIALNETS
+
+END DESIGN
+

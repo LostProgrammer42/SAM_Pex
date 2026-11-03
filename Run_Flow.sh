@@ -1,4 +1,3 @@
-g++ -std=c++17 -g Pex_Test.cpp -o Pex_Test
-rm -f *.sampex
-./Pex_Test ./INVX_routed.rect invx.sampex
-python3 Visualizer.py invx.sampex --animate
+g++ -O2 -std=c++17 Pex_Test.cpp -o pex
+./pex INVX1.def tech.cfg out.sampex
+python Visualizer.py out.sampex
