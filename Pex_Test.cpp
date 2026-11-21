@@ -58,7 +58,10 @@ inline Coupling pairCoupling(const Tech& t, const Segment& a, const Segment& b, 
         }
         if (spacing > t.halo) return c;
         const Layer& L = t.layers[a.layer];
-        c.side = t.eps() * t.fringe * L.thickness * prl / spacing;
+        if (t.useTable)
+            c.side = prl * t.curves[a.layer].at(spacing);  // captable value is fF per um of run
+        else
+            c.side = t.eps() * t.fringe * L.thickness * prl / spacing;
         if (g) {
             if (gapInX) {  // slab spans the x gap, and the y overlap
                 g->x1 = min(a.box.x2, b.box.x2);
@@ -266,7 +269,8 @@ bool writeSampex(const string& path, const Design& d, const Tech& t, const vecto
     fprintf(f, "],\n\"layer_z\":[");  // [z_bottom, thickness] per layer, same order as "layers"
     for (size_t i = 0; i < t.layers.size(); ++i)
         fprintf(f, "%s[%.6f,%.6f]", i ? "," : "", t.layers[i].zBottom, t.layers[i].thickness);
-    fprintf(f, "],\n\"halo\":%.6f,\n\"nets\":[", t.halo);
+    fprintf(f, "],\n\"halo\":%.6f,\n\"coupling_model\":\"%s\",\n\"nets\":[", t.halo,
+            t.useTable ? "table" : "analytic");
     for (size_t i = 0; i < d.netNames.size(); ++i)
         fprintf(f, "%s{\"name\":\"%s\",\"supply\":%s}", i ? "," : "", jsonEsc(d.netNames[i]).c_str(),
                 d.netIsSupply[i] ? "true" : "false");
@@ -309,13 +313,38 @@ bool writeSampex(const string& path, const Design& d, const Tech& t, const vecto
 }
 
 // ---------------------------------------------------------------- main
+// usage: pex [design.def] [tech.cfg] [out.sampex] [--model=analytic|table]
+//   --model overrides COUPLING_MODEL from the tech file, handy for comparing the two on the same design.
 int main(int argc, char** argv) {
-    string defPath = argc > 1 ? argv[1] : "test.def";
-    string techPath = argc > 2 ? argv[2] : "tech.cfg";
-    string outPath = argc > 3 ? argv[3] : "out.sampex";
+    vector<string> pos;
+    string modelOverride;
+    for (int i = 1; i < argc; ++i) {
+        string a = argv[i];
+        if (a.rfind("--model=", 0) == 0) modelOverride = a.substr(8);
+        else if (a.rfind("--", 0) == 0) {
+            fprintf(stderr, "error: unknown option '%s'\nusage: pex [design.def] [tech.cfg] [out.sampex] [--model=analytic|table]\n",
+                    a.c_str());
+            return 1;
+        } else pos.push_back(a);
+    }
+    string defPath = pos.size() > 0 ? pos[0] : "test.def";
+    string techPath = pos.size() > 1 ? pos[1] : "tech.cfg";
+    string outPath = pos.size() > 2 ? pos[2] : "out.sampex";
 
     Tech tech;
     if (!loadTech(techPath, tech)) return 1;
+    if (!modelOverride.empty()) {
+        if (modelOverride == "table") tech.useTable = true;
+        else if (modelOverride == "analytic") tech.useTable = false;
+        else {
+            fprintf(stderr, "error: --model must be analytic or table, got '%s'\n", modelOverride.c_str());
+            return 1;
+        }
+        if (!checkCouplingModel(tech)) return 1;
+    }
+    printf("Coupling model: %s", tech.useTable ? "TABLE" : "ANALYTIC (parallel-plate formula)");
+    if (tech.useTable) printf("  (%s)", tech.captableFile.c_str());
+    printf("\n");
 
     Design design;
     DefParser parser(tech, design);

@@ -53,11 +53,57 @@ struct Layer {
     double zBottom = 0, thickness = 0, minSpacing = 0, defWidth = 0;  // um
 };
 
+// Same-layer sidewall coupling per um of parallel run, as a function of edge spacing, for ONE layer.
+// A real captable comes from a field solver. Rows are (spacing, fF/um), spacing strictly ascending.
+// The width axis of a full captable is not modelled yet (the file format reserves it, see loadCapTables).
+//
+// Lookup rules (at()):
+//   spacing inside [first, last] row : interpolate linearly in log-log space. Coupling falls roughly as
+//                                      1/spacing, which is a straight line in log-log, so this is exact
+//                                      for a pure power law and a good fit for real curves.
+//   spacing above the last row       : 0 (no coupling; the last row acts as a cutoff, like HALO)
+//   spacing below the first row      : clamp to the first row's value, with one warning
+//   a row value of 0                 : that segment falls back to linear interpolation (log of 0 is undefined)
+struct CapCurve {
+    string layerName;
+    vector<double> s;  // spacings (um), strictly ascending
+    vector<double> c;  // coupling per um of run (fF/um), >= 0
+    mutable bool warnedLow = false;
+
+    bool empty() const { return s.empty(); }
+
+    double at(double spacing) const {
+        if (spacing > s.back() * (1 + 1e-9)) return 0.0;
+        if (spacing <= s.front()) {
+            if (spacing < s.front() * (1 - 1e-9) && !warnedLow) {
+                warnedLow = true;
+                fprintf(stderr,
+                        "warning: layer %s: spacing %.4f um is below the table's first row (%.4f um); "
+                        "clamping to that row (shown once)\n",
+                        layerName.c_str(), spacing, s.front());
+            }
+            return c.front();
+        }
+        size_t hi = (size_t)(upper_bound(s.begin(), s.end(), spacing) - s.begin());  // first row with s > spacing
+        if (hi >= s.size()) return c.back();                                        // spacing == last row
+        size_t lo = hi - 1;
+        if (c[lo] > 0 && c[hi] > 0) {
+            double u = (log(spacing) - log(s[lo])) / (log(s[hi]) - log(s[lo]));
+            return exp(log(c[lo]) + u * (log(c[hi]) - log(c[lo])));
+        }
+        double u = (spacing - s[lo]) / (s[hi] - s[lo]);
+        return c[lo] + u * (c[hi] - c[lo]);
+    }
+};
+
 struct Tech {
     vector<Layer> layers;  // sorted bottom -> top by zBottom
     double epsR = 3.9;
     double fringe = 1.0;
     double halo = 1.0;
+    bool useTable = false;    // COUPLING_MODEL TABLE: same-layer coupling comes from `curves`, not the formula
+    string captableFile;      // CAPTABLE_FILE (path as written in tech.cfg)
+    vector<CapCurve> curves;  // one per layer index; an empty curve means "no table for this layer"
 
     int layerIndex(const string& n) const {
         for (size_t i = 0; i < layers.size(); ++i)
@@ -70,6 +116,92 @@ struct Tech {
         return layers[lo + 1].zBottom - (layers[lo].zBottom + layers[lo].thickness);
     }
 };
+
+// captable.cfg format (whitespace separated, '#' starts a comment):
+//
+//   CAPTABLE <layer> WIDTH ANY
+//     <spacing_um>  <coupling_fF_per_um>
+//     ...                                  (>= 2 rows, spacing strictly ascending)
+//   END
+//
+// "WIDTH ANY" means the table does not depend on wire width. A numeric width (a width-indexed table) and a
+// third column are reserved for later and are rejected for now, so old files cannot be misread.
+inline bool loadCapTables(const string& path, Tech& t) {
+    ifstream f(path);
+    if (!f) {
+        fprintf(stderr, "error: cannot open captable file '%s'\n", path.c_str());
+        return false;
+    }
+    t.curves.assign(t.layers.size(), CapCurve());
+    string line;
+    int lineNo = 0;
+    CapCurve* cur = nullptr;
+    set<string> seen;
+    auto fail = [&](const string& msg) {
+        fprintf(stderr, "error: %s:%d: %s\n", path.c_str(), lineNo, msg.c_str());
+        return false;
+    };
+    while (getline(f, line)) {
+        ++lineNo;
+        size_t h = line.find('#');
+        if (h != string::npos) line.erase(h);
+        istringstream ss(line);
+        string kw;
+        if (!(ss >> kw)) continue;
+        if (kw == "CAPTABLE") {
+            if (cur) return fail("CAPTABLE found before END of the previous table");
+            string lname, wkw, wval;
+            if (!(ss >> lname >> wkw >> wval) || wkw != "WIDTH") return fail("expected: CAPTABLE <layer> WIDTH ANY");
+            if (wval != "ANY") return fail("width-indexed tables are not supported yet; use WIDTH ANY");
+            int li = t.layerIndex(lname);
+            if (li < 0) return fail("unknown layer '" + lname + "' (not in the tech file)");
+            if (!seen.insert(lname).second) return fail("second CAPTABLE for layer '" + lname + "'");
+            cur = &t.curves[li];
+            cur->layerName = lname;
+        } else if (kw == "END") {
+            if (!cur) return fail("END without CAPTABLE");
+            if (cur->s.size() < 2) return fail("table for '" + cur->layerName + "' needs at least 2 rows");
+            cur = nullptr;
+        } else {
+            if (!cur) return fail("data row outside a CAPTABLE block");
+            double sp, cv;
+            istringstream rs(line);
+            if (!(rs >> sp >> cv)) return fail("expected a row: <spacing_um> <coupling_fF_per_um>");
+            string extra;
+            if (rs >> extra) return fail("unexpected third column (width-indexed rows are not supported yet)");
+            if (!(sp > 0)) return fail("spacing must be > 0");
+            if (!(cv >= 0)) return fail("coupling must be >= 0");
+            if (!cur->s.empty() && !(sp > cur->s.back()))
+                return fail("spacing must be strictly increasing within a table");
+            cur->s.push_back(sp);
+            cur->c.push_back(cv);
+        }
+    }
+    if (cur) return fail("missing END for table '" + cur->layerName + "'");
+    return true;
+}
+
+// COUPLING_MODEL TABLE needs a table on every layer. Called after the tech file is read, and again if
+// the model is switched on the command line.
+inline bool checkCouplingModel(const Tech& t) {
+    if (!t.useTable) return true;
+    if (t.captableFile.empty()) {
+        fprintf(stderr, "error: COUPLING_MODEL TABLE needs a CAPTABLE_FILE line in the tech file\n");
+        return false;
+    }
+    for (size_t i = 0; i < t.layers.size(); ++i) {
+        if (i >= t.curves.size() || t.curves[i].empty()) {
+            fprintf(stderr, "error: COUPLING_MODEL TABLE but layer '%s' has no CAPTABLE in '%s'\n",
+                    t.layers[i].name.c_str(), t.captableFile.c_str());
+            return false;
+        }
+        if (t.curves[i].s.back() < t.halo)
+            fprintf(stderr,
+                    "note: layer %s table ends at %.3f um, below HALO %.3f um: pairs in between get no coupling\n",
+                    t.layers[i].name.c_str(), t.curves[i].s.back(), t.halo);
+    }
+    return true;
+}
 
 inline bool loadTech(const string& path, Tech& t) {
     ifstream f(path);
@@ -97,6 +229,17 @@ inline bool loadTech(const string& path, Tech& t) {
             ss >> t.fringe;
         } else if (kw == "HALO") {
             ss >> t.halo;
+        } else if (kw == "COUPLING_MODEL") {
+            string m;
+            ss >> m;
+            if (m == "TABLE") t.useTable = true;
+            else if (m == "ANALYTIC") t.useTable = false;
+            else {
+                fprintf(stderr, "error: COUPLING_MODEL must be ANALYTIC or TABLE, got '%s'\n", m.c_str());
+                return false;
+            }
+        } else if (kw == "CAPTABLE_FILE") {
+            ss >> t.captableFile;
         } else {
             fprintf(stderr, "warning: unknown tech keyword '%s'\n", kw.c_str());
         }
@@ -107,7 +250,15 @@ inline bool loadTech(const string& path, Tech& t) {
         fprintf(stderr, "error: no layers in tech file\n");
         return false;
     }
-    return true;
+    t.curves.assign(t.layers.size(), CapCurve());
+    if (!t.captableFile.empty()) {
+        // a relative captable path is relative to the folder of the tech file
+        string tablePath = t.captableFile;
+        size_t slash = path.find_last_of("/\\");
+        if (tablePath[0] != '/' && slash != string::npos) tablePath = path.substr(0, slash + 1) + tablePath;
+        if (!loadCapTables(tablePath, t)) return false;
+    }
+    return checkCouplingModel(t);
 }
 
 // ---------------------------------------------------------------- design
