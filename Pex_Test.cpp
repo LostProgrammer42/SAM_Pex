@@ -4,6 +4,9 @@
 //   ./pex [design.def] [tech.cfg] [out.sampex]
 #include "Helpers.cpp"
 #include "Quad_Trees.cpp"
+#include "Connectivity.cpp"
+#include "Merge.cpp"
+#include "RCNet.cpp"
 
 #include <chrono>
 #include <functional>
@@ -255,7 +258,7 @@ static string jsonEsc(const string& s) {
 }
 
 bool writeSampex(const string& path, const Design& d, const Tech& t, const vector<QuadTree>& trees,
-                 const CouplingMap& cm, const vector<PairRec>& pairs) {
+                 const CouplingMap& cm, const vector<PairRec>& pairs, const Connectivity& conn, const RCNet& rc) {
     FILE* f = fopen(path.c_str(), "w");
     if (!f) {
         fprintf(stderr, "error: cannot write '%s'\n", path.c_str());
@@ -277,11 +280,39 @@ bool writeSampex(const string& path, const Design& d, const Tech& t, const vecto
     fprintf(f, "],\n\"segments\":[\n");
     for (size_t i = 0; i < d.segs.size(); ++i) {
         const Segment& s = d.segs[i];
-        fprintf(f, "%s{\"id\":%d,\"net\":%d,\"layer\":%d,\"via\":%s,\"llx\":%.6f,\"lly\":%.6f,\"wx\":%.6f,\"wy\":%.6f}",
+        fprintf(f, "%s{\"id\":%d,\"net\":%d,\"layer\":%d,\"via\":%s,\"llx\":%.6f,\"lly\":%.6f,\"wx\":%.6f,\"wy\":%.6f,"
+                   "\"dir\":\"%c\",\"cx1\":%.6f,\"cy1\":%.6f,\"cx2\":%.6f,\"cy2\":%.6f,\"width\":%.6f,"
+                   "\"via_inst\":%d,\"piece\":%d}",
                 i ? ",\n" : "", s.id, s.net, s.layer, s.isVia ? "true" : "false", s.box.x1, s.box.y1,
-                s.box.w(), s.box.h());
+                s.box.w(), s.box.h(), s.dir, s.cx1, s.cy1, s.cx2, s.cy2, s.width, s.viaInst, conn.piece[i]);
     }
-    fprintf(f, "\n],\n\"trees\":[\n");
+    fprintf(f, "\n],\n\"layer_rsheet\":[");
+    for (size_t i = 0; i < t.layers.size(); ++i) fprintf(f, "%s%.9g", i ? "," : "", t.layers[i].rsheet);
+    fprintf(f, "],\n\"vias\":[");
+    for (size_t i = 0; i < d.vias.size(); ++i) {
+        const ViaInst& v = d.vias[i];
+        double r = (v.nCuts > 0 && t.cutR.count(v.cutLayer)) ? t.cutR.at(v.cutLayer) / v.nCuts : 0;
+        fprintf(f, "%s{\"id\":%d,\"name\":\"%s\",\"net\":%d,\"x\":%.6f,\"y\":%.6f,\"ncuts\":%d,\"r_ohm\":%.9g,\"pads\":[",
+                i ? "," : "", v.id, jsonEsc(v.name).c_str(), v.net, v.x, v.y, v.nCuts, r);
+        for (size_t k = 0; k < v.pads.size(); ++k) fprintf(f, "%s%d", k ? "," : "", v.pads[k]);
+        fprintf(f, "]}");
+    }
+    fprintf(f, "],\n\"connectivity\":{\"n_pieces\":%d,\"piece_net\":[", conn.nPieces);
+    for (int p = 0; p < conn.nPieces; ++p) fprintf(f, "%s%d", p ? "," : "", conn.pieceNet[p]);
+    fprintf(f, "],\"shorts\":[");
+    for (size_t i = 0; i < conn.shorts.size(); ++i) fprintf(f, "%s[%d,%d]", i ? "," : "", conn.shorts[i].a, conn.shorts[i].b);
+    fprintf(f, "]},\n\"rc\":{\"nodes\":[");
+    for (size_t i = 0; i < rc.nodes.size(); ++i) {
+        const RCNode& n = rc.nodes[i];
+        fprintf(f, "%s{\"id\":%d,\"x\":%.6f,\"y\":%.6f,\"layer\":%d,\"net\":%d,\"piece\":%d}", i ? "," : "", n.id, n.x, n.y, n.layer, n.net, n.piece);
+    }
+    fprintf(f, "],\"res\":[");
+    for (size_t i = 0; i < rc.res.size(); ++i) {
+        const RCRes& r = rc.res[i];
+        fprintf(f, "%s{\"a\":%d,\"b\":%d,\"ohm\":%.9g,\"seg\":%d,\"via\":%d,\"x1\":%.6f,\"y1\":%.6f,\"x2\":%.6f,\"y2\":%.6f,\"len\":%.6f,\"width\":%.6f,\"layer\":%d}",
+                i ? "," : "", r.a, r.b, r.ohm, r.seg, r.via, r.x1, r.y1, r.x2, r.y2, r.len, r.width, r.layer);
+    }
+    fprintf(f, "]},\n\"trees\":[\n");
     for (size_t i = 0; i < trees.size(); ++i) {
         fprintf(f, "%s{\"layer\":%zu,\"nodes\":", i ? ",\n" : "", i);
         trees[i].writeNodesJson(f);
@@ -313,16 +344,17 @@ bool writeSampex(const string& path, const Design& d, const Tech& t, const vecto
 }
 
 // ---------------------------------------------------------------- main
-// usage: pex [design.def] [tech.cfg] [out.sampex] [--model=analytic|table]
+// usage: pex [design.def] [tech.cfg] [out.sampex] [--model=analytic|table] [--merge=on|off]
 //   --model overrides COUPLING_MODEL from the tech file, handy for comparing the two on the same design.
 int main(int argc, char** argv) {
     vector<string> pos;
-    string modelOverride;
+    string modelOverride, mergeOverride;
     for (int i = 1; i < argc; ++i) {
         string a = argv[i];
         if (a.rfind("--model=", 0) == 0) modelOverride = a.substr(8);
+        else if (a.rfind("--merge=", 0) == 0) mergeOverride = a.substr(8);
         else if (a.rfind("--", 0) == 0) {
-            fprintf(stderr, "error: unknown option '%s'\nusage: pex [design.def] [tech.cfg] [out.sampex] [--model=analytic|table]\n",
+            fprintf(stderr, "error: unknown option '%s'\nusage: pex [design.def] [tech.cfg] [out.sampex] [--model=analytic|table] [--merge=on|off]\n",
                     a.c_str());
             return 1;
         } else pos.push_back(a);
@@ -342,6 +374,14 @@ int main(int argc, char** argv) {
         }
         if (!checkCouplingModel(tech)) return 1;
     }
+    if (!mergeOverride.empty()) {
+        if (mergeOverride == "on") tech.mergeFragments = true;
+        else if (mergeOverride == "off") tech.mergeFragments = false;
+        else {
+            fprintf(stderr, "error: --merge must be on or off, got '%s'\n", mergeOverride.c_str());
+            return 1;
+        }
+    }
     printf("Coupling model: %s", tech.useTable ? "TABLE" : "ANALYTIC (parallel-plate formula)");
     if (tech.useTable) printf("  (%s)", tech.captableFile.c_str());
     printf("\n");
@@ -352,6 +392,14 @@ int main(int argc, char** argv) {
     if (design.segs.empty()) {
         fprintf(stderr, "error: no routing shapes found on tech layers\n");
         return 1;
+    }
+
+    if (tech.mergeFragments) {
+        MergeStats ms = mergeFragments(design);
+        printf("Fragment merge: ON  -> %d wires became %d (%d fragmented cluster%s rebuilt)\n", ms.wiresBefore,
+               ms.wiresAfter, ms.clustersMerged, ms.clustersMerged == 1 ? "" : "s");
+    } else {
+        printf("Fragment merge: OFF (wires used exactly as in the DEF)\n");
     }
 
     // Tree bounds: die area united with every shape (shapes may stick out of the die)
@@ -381,6 +429,14 @@ int main(int argc, char** argv) {
 
     auto t0 = chrono::steady_clock::now();
     vector<PairRec> pairRecs;
+    Connectivity conn = buildConnectivity(design, trees);
+    reportConnectivity(design, tech, conn);
+    printf("  validation vs brute force: %s\n", sameConnectivity(conn, buildConnectivityBrute(design)) ? "PASS" : "FAIL");
+
+    RCNet rcnet = buildRC(design, tech, conn);
+    reportRC(design, tech, rcnet);
+    printf("  graph check (one resistor component per piece): %s\n", checkRC(design, conn, rcnet) ? "PASS" : "FAIL");
+
     CouplingMap viaTree = extractWithTrees(tech, design.segs, trees, &pairRecs);
     auto t1 = chrono::steady_clock::now();
     CouplingMap brute = extractBrute(tech, design.segs);
@@ -425,6 +481,6 @@ int main(int argc, char** argv) {
            pairRecs.size());
 
     printf("\nContributing shape pairs recorded: %zu\n", pairRecs.size());
-    if (writeSampex(outPath, design, tech, trees, viaTree, pairRecs)) printf("\nWrote %s\n", outPath.c_str());
+    if (writeSampex(outPath, design, tech, trees, viaTree, pairRecs, conn, rcnet)) printf("\nWrote %s\n", outPath.c_str());
     return ok ? 0 : 2;
 }

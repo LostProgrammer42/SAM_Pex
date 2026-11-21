@@ -45,12 +45,23 @@ struct Segment {
     int layer = -1;      // index into Tech::layers
     bool isVia = false;  // true if this shape came from a via definition
     Rect box;            // metal rectangle, microns
+
+    // The wire as the DEF describes it: a centreline plus a width. Direction is what tells us which
+    // side of the rectangle is the length (current flows along it) and which is the width.
+    char dir = 'N';                              // 'H' horizontal wire, 'V' vertical wire, 'N' none (a via pad)
+    double cx1 = 0, cy1 = 0, cx2 = 0, cy2 = 0;   // centreline end points (um), (cx1,cy1) is the lower/left end;
+                                                 // for a via pad both ends are the via centre
+    double width = 0;                            // um, across the direction (wires only)
+    int viaInst = -1;                            // index into Design::vias for via pads, -1 for wires
+
+    double length() const { return fabs(cx2 - cx1) + fabs(cy2 - cy1); }  // um, along the centreline
 };
 
 // ---------------------------------------------------------------- technology
 struct Layer {
     string name;
     double zBottom = 0, thickness = 0, minSpacing = 0, defWidth = 0;  // um
+    double rsheet = 0;  // sheet resistance, ohm per square (RSHEET line in the tech file); 0 = not given
 };
 
 // Same-layer sidewall coupling per um of parallel run, as a function of edge spacing, for ONE layer.
@@ -101,9 +112,12 @@ struct Tech {
     double epsR = 3.9;
     double fringe = 1.0;
     double halo = 1.0;
+    bool mergeFragments = true;  // MERGE_FRAGMENTS ON|OFF: merge fragmented same-net wires after parsing
+    double maxSegLen = 0;  // um; if > 0, wires are cut so no resistor is longer than this (MAX_SEG_LEN)
     bool useTable = false;    // COUPLING_MODEL TABLE: same-layer coupling comes from `curves`, not the formula
     string captableFile;      // CAPTABLE_FILE (path as written in tech.cfg)
     vector<CapCurve> curves;  // one per layer index; an empty curve means "no table for this layer"
+    map<string, double> cutR; // ohm per cut, by cut-layer name (CUT_R lines); a via's R = cutR / number of cuts
 
     int layerIndex(const string& n) const {
         for (size_t i = 0; i < layers.size(); ++i)
@@ -210,6 +224,7 @@ inline bool loadTech(const string& path, Tech& t) {
         return false;
     }
     string line;
+    vector<pair<string, double>> rsheetLines;
     while (getline(f, line)) {
         size_t h = line.find('#');
         if (h != string::npos) line.erase(h);
@@ -229,6 +244,21 @@ inline bool loadTech(const string& path, Tech& t) {
             ss >> t.fringe;
         } else if (kw == "HALO") {
             ss >> t.halo;
+        } else if (kw == "MERGE_FRAGMENTS") {
+            string v;
+            ss >> v;
+            for (auto& ch : v) ch = (char)toupper((unsigned char)ch);
+            if (v == "ON") t.mergeFragments = true;
+            else if (v == "OFF") t.mergeFragments = false;
+            else {
+                fprintf(stderr, "error: bad MERGE_FRAGMENTS line (expected ON or OFF): %s\n", line.c_str());
+                return false;
+            }
+        } else if (kw == "MAX_SEG_LEN") {
+            if (!(ss >> t.maxSegLen) || t.maxSegLen < 0) {
+                fprintf(stderr, "error: bad MAX_SEG_LEN line (expected a length in um, 0 = off): %s\n", line.c_str());
+                return false;
+            }
         } else if (kw == "COUPLING_MODEL") {
             string m;
             ss >> m;
@@ -240,6 +270,22 @@ inline bool loadTech(const string& path, Tech& t) {
             }
         } else if (kw == "CAPTABLE_FILE") {
             ss >> t.captableFile;
+        } else if (kw == "RSHEET") {
+            string ln;
+            double v;
+            if (!(ss >> ln >> v) || !(v >= 0)) {
+                fprintf(stderr, "error: bad RSHEET line (expected: RSHEET <layer> <ohm_per_square>): %s\n", line.c_str());
+                return false;
+            }
+            rsheetLines.push_back({ln, v});  // applied once all layers are known
+        } else if (kw == "CUT_R") {
+            string cl;
+            double v;
+            if (!(ss >> cl >> v) || !(v >= 0)) {
+                fprintf(stderr, "error: bad CUT_R line (expected: CUT_R <cut_layer> <ohm_per_cut>): %s\n", line.c_str());
+                return false;
+            }
+            t.cutR[cl] = v;
         } else {
             fprintf(stderr, "warning: unknown tech keyword '%s'\n", kw.c_str());
         }
@@ -249,6 +295,14 @@ inline bool loadTech(const string& path, Tech& t) {
     if (t.layers.empty()) {
         fprintf(stderr, "error: no layers in tech file\n");
         return false;
+    }
+    for (auto& rl : rsheetLines) {
+        int li = t.layerIndex(rl.first);
+        if (li < 0) {
+            fprintf(stderr, "error: RSHEET for unknown layer '%s' (declare it with LAYER first)\n", rl.first.c_str());
+            return false;
+        }
+        t.layers[li].rsheet = rl.second;
     }
     t.curves.assign(t.layers.size(), CapCurve());
     if (!t.captableFile.empty()) {
@@ -262,6 +316,18 @@ inline bool loadTech(const string& path, Tech& t) {
 }
 
 // ---------------------------------------------------------------- design
+// One placed via. Its metal pads are ordinary Segments (isVia = true, viaInst = this index); the cut
+// between them is not a conductor for coupling but it is what carries current between the two layers.
+struct ViaInst {
+    int id = -1;
+    string name;          // name in the DEF, e.g. mcon_170_220
+    int net = -1;
+    double x = 0, y = 0;  // centre (um)
+    string cutLayer;      // layer of the cut rectangles (not a routing layer); "" if the via has none
+    int nCuts = 0;        // number of cut rectangles
+    vector<int> pads;     // segment ids of the metal pads, one per routing layer the via touches
+};
+
 struct Design {
     string name;
     double dbu = 1000;  // DEF database units per micron
@@ -269,6 +335,7 @@ struct Design {
     vector<string> netNames;
     vector<char> netIsSupply;
     vector<Segment> segs;
+    vector<ViaInst> vias;
     map<string, int> netIndex;
 
     int getNet(const string& n) {
@@ -528,8 +595,14 @@ private:
             warnOnce("nonmanhattan", "non-Manhattan wire skipped");
             return;
         }
+        bool horiz = fabs(y1 - y2) < 0.5;
         r = Rect{r.x1 / design.dbu, r.y1 / design.dbu, r.x2 / design.dbu, r.y2 / design.dbu};
-        pushSeg(net, L, false, r);
+        int id = pushSeg(net, L, false, r);
+        Segment& s = design.segs[id];
+        s.dir = horiz ? 'H' : 'V';
+        s.width = widthDbu / design.dbu;
+        s.cx1 = min(x1, x2) / design.dbu;  s.cx2 = max(x1, x2) / design.dbu;
+        s.cy1 = min(y1, y2) / design.dbu;  s.cy2 = max(y1, y2) / design.dbu;
     }
 
     void placeVia(int net, const string& name, double x, double y) {
@@ -538,16 +611,34 @@ private:
             warnOnce("via:" + name, "via '" + name + "' not defined in DEF VIAS; skipped");
             return;
         }
+        ViaInst vi;
+        vi.id = (int)design.vias.size();
+        vi.name = name;
+        vi.net = net;
+        vi.x = x / design.dbu;
+        vi.y = y / design.dbu;
         for (auto& s : it->second) {
             int L = tech.layerIndex(s.layer);
-            if (L < 0) continue;  // e.g. the 'mcon' cut layer: not a conductor for coupling
+            if (L < 0) {  // a cut layer (e.g. mcon): not a conductor for coupling, but it carries current
+                if (tech.cutR.count(s.layer)) {
+                    vi.cutLayer = s.layer;
+                    vi.nCuts++;
+                }
+                continue;
+            }
             Rect r{(x + s.r.x1) / design.dbu, (y + s.r.y1) / design.dbu,
                    (x + s.r.x2) / design.dbu, (y + s.r.y2) / design.dbu};
-            pushSeg(net, L, true, r);
+            int id = pushSeg(net, L, true, r);
+            Segment& sg = design.segs[id];
+            sg.viaInst = vi.id;
+            sg.cx1 = sg.cx2 = vi.x;
+            sg.cy1 = sg.cy2 = vi.y;
+            vi.pads.push_back(id);
         }
+        design.vias.push_back(vi);
     }
 
-    void pushSeg(int net, int L, bool isVia, const Rect& r) {
+    int pushSeg(int net, int L, bool isVia, const Rect& r) {
         Segment s;
         s.id = (int)design.segs.size();
         s.net = net;
@@ -555,5 +646,6 @@ private:
         s.isVia = isVia;
         s.box = r;
         design.segs.push_back(s);
+        return s.id;
     }
 };
